@@ -5,6 +5,8 @@ on:
     types: [created]
   issues:
     types: [opened]
+  pull_request_review_comment:
+    types: [created]
 
 permissions:
   issues: write
@@ -20,7 +22,10 @@ jobs:
        github.event.comment.user.login == 'arash77') ||
       (github.event_name == 'issues' &&
        contains(github.event.issue.body, '@gemma') &&
-       github.event.issue.user.login == 'arash77')
+       github.event.issue.user.login == 'arash77') ||
+      (github.event_name == 'pull_request_review_comment' &&
+       contains(github.event.comment.body, '@gemma') &&
+       github.event.comment.user.login == 'arash77')
 
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -28,7 +33,7 @@ jobs:
     steps:
       # Let you know the bot saw your comment
       - name: React with eyes to comment
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -36,37 +41,117 @@ jobs:
             "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content=eyes
 
-      # Pull the body from whichever event fired and extract the prompt after @gemma
-      - name: Extract prompt
+      # Parse @gemma:MODEL syntax — supported tags: E2B, E4B (default: E4B)
+      # Example: "@gemma:E2B explain DNS" or "@gemma what is 2+2?"
+      - name: Extract prompt and model
         id: extract
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_BODY:   ${{ github.event.issue.body }}
+          EVENT_NAME:   ${{ github.event_name }}
         run: |
-          if [[ "$EVENT_NAME" == "issue_comment" ]]; then
+          if [[ "$EVENT_NAME" == "issue_comment" || "$EVENT_NAME" == "pull_request_review_comment" ]]; then
             export RAW_BODY="$COMMENT_BODY"
           else
             export RAW_BODY="$ISSUE_BODY"
           fi
 
-          # Use Python (pre-installed on ubuntu-latest) for reliable multiline extraction
-          PROMPT=$(python3 - <<'PYEOF'
+          python3 - <<'PYEOF'
           import re, os, sys
+
+          MODEL_MAP = {
+              'E2B': ('litert-community/gemma-4-E2B-it-litert-lm', 'gemma-4-E2B-it.litertlm'),
+              'E4B': ('litert-community/gemma-4-E4B-it-litert-lm', 'gemma-4-E4B-it.litertlm'),
+          }
+          DEFAULT_MODEL = 'E4B'
+
           body = os.environ.get('RAW_BODY', '')
-          m = re.search(r'@gemma\s+([\s\S]+)', body, re.IGNORECASE)
-          if m:
-              print(m.group(1)[:2000].strip())
-          else:
+          # Match @gemma optionally followed by :MODEL then the prompt
+          m = re.search(r'@gemma(?::(\w+))?\s+([\s\S]+)', body, re.IGNORECASE)
+          if not m:
               print("No prompt found after @gemma", file=sys.stderr)
               sys.exit(1)
+
+          tag_raw = (m.group(1) or DEFAULT_MODEL).upper()
+          if tag_raw not in MODEL_MAP:
+              print(f"Unknown model tag '{tag_raw}', falling back to {DEFAULT_MODEL}", file=sys.stderr)
+              tag_raw = DEFAULT_MODEL
+
+          prompt = m.group(2)[:2000].strip()
+          hf_repo, model_file = MODEL_MAP[tag_raw]
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'model_tag={tag_raw}\n')
+              f.write(f'hf_repo={hf_repo}\n')
+              f.write(f'model_file={model_file}\n')
+              f.write('prompt<<GEMMA_HEREDOC\n')
+              f.write(prompt + '\n')
+              f.write('GEMMA_HEREDOC\n')
           PYEOF
-          )
-          {
-            echo 'prompt<<GEMMA_HEREDOC'
-            printf '%s\n' "$PROMPT"
-            echo 'GEMMA_HEREDOC'
-          } >> "$GITHUB_OUTPUT"
+
+      # Fetch issue title, body, and last 5 comments to give the model full context
+      - name: Gather issue context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMPT:   ${{ steps.extract.outputs.prompt }}
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request_review_comment" ]]; then
+            export ISSUE_NUMBER="${{ github.event.pull_request.number }}"
+          else
+            export ISSUE_NUMBER="${{ github.event.issue.number }}"
+          fi
+
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          repo      = os.environ['GITHUB_REPOSITORY']
+          issue_num = os.environ['ISSUE_NUMBER']
+          prompt    = os.environ['PROMPT']
+
+          def gh_api(path):
+              r = subprocess.run(['gh', 'api', path], capture_output=True, text=True, check=True)
+              return json.loads(r.stdout)
+
+          try:
+              issue        = gh_api(f'/repos/{repo}/issues/{issue_num}')
+              comments_raw = gh_api(
+                  f'/repos/{repo}/issues/{issue_num}/comments?per_page=5&direction=desc'
+              )
+          except subprocess.CalledProcessError as e:
+              print(f"Context fetch failed: {e.stderr}", file=sys.stderr)
+              issue, comments_raw = {}, []
+
+          parts = [
+              "You are a helpful AI assistant embedded in a GitHub issue tracker. "
+              "Be concise, accurate, and use Markdown formatting. "
+              "Use the provided context to answer the request at the end."
+          ]
+
+          title = issue.get('title', '').strip()
+          body  = (issue.get('body') or '').strip()
+          if title:
+              parts.append(f'## Issue: {title}')
+          if body:
+              parts.append(body[:600])
+
+          if comments_raw:
+              parts.append('## Recent comments (oldest first)')
+              for c in reversed(comments_raw):
+                  author = c.get('user', {}).get('login', 'unknown')
+                  text   = (c.get('body') or '').strip()[:300]
+                  parts.append(f'**{author}**: {text}')
+
+          parts.append('## Request')
+          parts.append(prompt)
+
+          full_prompt = '\n\n'.join(parts)[:3000]
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('full_prompt<<GEMMA_HEREDOC\n')
+              f.write(full_prompt + '\n')
+              f.write('GEMMA_HEREDOC\n')
+          PYEOF
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.0.0
@@ -78,12 +163,12 @@ jobs:
           # We don't check out the repo, so suppress the empty-workdir warning
           ignore-empty-workdir: true
 
-      # Cache the ~2 GB model so only the very first run pays the download cost
+      # Per-model cache — E2B and E4B are stored separately so switching models works correctly
       - name: Cache Hugging Face model
         uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
-          key: hf-gemma-4-E4B-it-litert-lm-v1
+          key: hf-${{ steps.extract.outputs.model_tag }}-v1
 
       - name: Install litert-lm
         run: uv tool install litert-lm
@@ -91,14 +176,15 @@ jobs:
       - name: Run Gemma
         id: gemma
         env:
-          PROMPT: ${{ steps.extract.outputs.prompt }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          FULL_PROMPT: ${{ steps.context.outputs.full_prompt }}
+          HF_TOKEN:    ${{ secrets.HF_TOKEN }}
+          HF_REPO:     ${{ steps.extract.outputs.hf_repo }}
+          MODEL_FILE:  ${{ steps.extract.outputs.model_file }}
         run: |
-          # stderr (HF auth warnings, progress logs) goes to the Actions log; capture stdout only
           RESPONSE=$(litert-lm run \
-            --from-huggingface-repo=litert-community/gemma-4-E4B-it-litert-lm \
-            gemma-4-E4B-it.litertlm \
-            --prompt="$PROMPT")
+            --from-huggingface-repo="$HF_REPO" \
+            "$MODEL_FILE" \
+            --prompt="$FULL_PROMPT")
 
           # Strip any leading "Downloading ..." status lines litert-lm prints to stdout
           RESPONSE=$(printf '%s\n' "$RESPONSE" | grep -v '^Downloading ')
@@ -112,17 +198,23 @@ jobs:
 
       - name: Post reply
         env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          RESPONSE: ${{ steps.gemma.outputs.response }}
+          GH_TOKEN:  ${{ github.token }}
+          RESPONSE:  ${{ steps.gemma.outputs.response }}
+          MODEL_TAG: ${{ steps.extract.outputs.model_tag }}
         run: |
+          if [[ "${{ github.event_name }}" == "pull_request_review_comment" ]]; then
+            ISSUE_NUMBER="${{ github.event.pull_request.number }}"
+          else
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+          fi
+
           {
             echo "🤖 **Gemma says:**"
             echo ""
             printf '%s\n' "$RESPONSE"
             echo ""
             echo "---"
-            echo "_Powered by [LiteRT-LM CLI](https://ai.google.dev/edge/litert-lm/cli) · Model: \`gemma-4-E4B-it\`_"
+            echo "_Powered by [LiteRT-LM CLI](https://ai.google.dev/edge/litert-lm/cli) · Model: \`gemma-4-${MODEL_TAG}-it\`_"
           } > /tmp/reply.md
 
           gh issue comment "$ISSUE_NUMBER" \
