@@ -6,6 +6,11 @@ on:
   issues:
     types: [opened]
 
+# Opt into Node.js 24 now to silence the Node.js 20 deprecation warnings from
+# actions/cache, actions/setup-python, and astral-sh/setup-uv.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   issues: write
   pull-requests: write
@@ -75,6 +80,11 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          # No uv.lock or requirements files in this repo — disable glob-based caching
+          cache-dependency-glob: ""
+          # We don't check out the repo, so suppress the empty-workdir warning
+          ignore-empty-workdir: true
 
       # Cache the ~2 GB model so only the very first run pays the download cost
       - name: Cache Hugging Face model
@@ -91,11 +101,14 @@ jobs:
         env:
           PROMPT: ${{ steps.extract.outputs.prompt }}
         run: |
-          # stderr (download/progress logs) goes to the Actions log; we only capture stdout
+          # stderr (HF auth warnings, progress logs) goes to the Actions log; capture stdout only
           RESPONSE=$(litert-lm run \
             --from-huggingface-repo=litert-community/gemma-4-E2B-it-litert-lm \
             gemma-4-E2B-it.litertlm \
             --prompt="$PROMPT")
+
+          # Strip any leading "Downloading ..." status lines litert-lm prints to stdout
+          RESPONSE=$(printf '%s\n' "$RESPONSE" | grep -v '^Downloading ')
 
           # Cap at 8 KB to stay well within GitHub comment limits
           {
