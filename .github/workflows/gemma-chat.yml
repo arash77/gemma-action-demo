@@ -68,14 +68,11 @@ jobs:
             echo 'GEMMA_HEREDOC'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-
       - name: Install uv
         uses: astral-sh/setup-uv@v8.0.0
         with:
+          python-version: '3.14'
+          enable-cache: true
           # No uv.lock or requirements files in this repo — disable glob-based caching
           cache-dependency-glob: ""
           # We don't check out the repo, so suppress the empty-workdir warning
@@ -86,7 +83,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
-          key: hf-gemma-4-E2B-it-litert-lm-v1
+          key: hf-gemma-4-E4B-it-litert-lm-v1
 
       - name: Install litert-lm
         run: uv tool install litert-lm
@@ -98,8 +95,8 @@ jobs:
         run: |
           # stderr (HF auth warnings, progress logs) goes to the Actions log; capture stdout only
           RESPONSE=$(litert-lm run \
-            --from-huggingface-repo=litert-community/gemma-4-E2B-it-litert-lm \
-            gemma-4-E2B-it.litertlm \
+            --from-huggingface-repo=litert-community/gemma-4-E4B-it-litert-lm \
+            gemma-4-E4B-it.litertlm \
             --prompt="$PROMPT")
 
           # Strip any leading "Downloading ..." status lines litert-lm prints to stdout
@@ -124,7 +121,7 @@ jobs:
             printf '%s\n' "$RESPONSE"
             echo ""
             echo "---"
-            echo "_Powered by [LiteRT-LM CLI](https://ai.google.dev/edge/litert-lm/cli) · Model: \`gemma-4-E2B-it\`_"
+            echo "_Powered by [LiteRT-LM CLI](https://ai.google.dev/edge/litert-lm/cli) · Model: \`gemma-4-E4B-it\`_"
           } > /tmp/reply.md
 
           gh issue comment "$ISSUE_NUMBER" \
