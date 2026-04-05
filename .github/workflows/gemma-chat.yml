@@ -6,11 +6,6 @@ on:
   issues:
     types: [opened]
 
-# Opt into Node.js 24 now to silence the Node.js 20 deprecation warnings from
-# actions/cache, actions/setup-python, and astral-sh/setup-uv.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 permissions:
   issues: write
   pull-requests: write
@@ -74,12 +69,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.0.0
         with:
           # No uv.lock or requirements files in this repo — disable glob-based caching
           cache-dependency-glob: ""
@@ -88,7 +83,7 @@ jobs:
 
       # Cache the ~2 GB model so only the very first run pays the download cost
       - name: Cache Hugging Face model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
           key: hf-gemma-4-E2B-it-litert-lm-v1
