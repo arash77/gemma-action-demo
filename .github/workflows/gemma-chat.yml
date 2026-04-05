@@ -1,0 +1,124 @@
+name: Gemma Chat
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  chat:
+    # Only respond to the repo owner to avoid burning your free Actions minutes
+    if: >-
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, '@gemma') &&
+       github.event.comment.user.login == 'arash77') ||
+      (github.event_name == 'issues' &&
+       contains(github.event.issue.body, '@gemma') &&
+       github.event.issue.user.login == 'arash77')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # Let you know the bot saw your comment
+      - name: React with eyes to comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST \
+            "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes
+
+      # Pull the body from whichever event fired and extract the prompt after @gemma
+      - name: Extract prompt
+        id: extract
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "issue_comment" ]]; then
+            export RAW_BODY="$COMMENT_BODY"
+          else
+            export RAW_BODY="$ISSUE_BODY"
+          fi
+
+          # Use Python (pre-installed on ubuntu-latest) for reliable multiline extraction
+          PROMPT=$(python3 - <<'PYEOF'
+          import re, os, sys
+          body = os.environ.get('RAW_BODY', '')
+          m = re.search(r'@gemma\s+([\s\S]+)', body, re.IGNORECASE)
+          if m:
+              print(m.group(1)[:2000].strip())
+          else:
+              print("No prompt found after @gemma", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+          )
+          {
+            echo 'prompt<<GEMMA_HEREDOC'
+            printf '%s\n' "$PROMPT"
+            echo 'GEMMA_HEREDOC'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # Cache the ~2 GB model so only the very first run pays the download cost
+      - name: Cache Hugging Face model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-gemma-4-E2B-it-litert-lm-v1
+
+      - name: Install litert-lm
+        run: uv tool install litert-lm
+
+      - name: Run Gemma
+        id: gemma
+        env:
+          PROMPT: ${{ steps.extract.outputs.prompt }}
+        run: |
+          # stderr (download/progress logs) goes to the Actions log; we only capture stdout
+          RESPONSE=$(litert-lm run \
+            --from-huggingface-repo=litert-community/gemma-4-E2B-it-litert-lm \
+            gemma-4-E2B-it.litertlm \
+            --prompt="$PROMPT")
+
+          # Cap at 8 KB to stay well within GitHub comment limits
+          {
+            echo 'response<<GEMMA_HEREDOC'
+            printf '%s\n' "$RESPONSE" | head -c 8000
+            echo 'GEMMA_HEREDOC'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post reply
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RESPONSE: ${{ steps.gemma.outputs.response }}
+        run: |
+          {
+            echo "🤖 **Gemma says:**"
+            echo ""
+            printf '%s\n' "$RESPONSE"
+            echo ""
+            echo "---"
+            echo "_Powered by [LiteRT-LM CLI](https://ai.google.dev/edge/litert-lm/cli) · Model: \`gemma-4-E2B-it\`_"
+          } > /tmp/reply.md
+
+          gh issue comment "$ISSUE_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/reply.md
