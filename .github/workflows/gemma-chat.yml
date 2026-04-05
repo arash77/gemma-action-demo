@@ -92,6 +92,7 @@ jobs:
         id: gemma
         env:
           PROMPT: ${{ steps.extract.outputs.prompt }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           # stderr (HF auth warnings, progress logs) goes to the Actions log; capture stdout only
           RESPONSE=$(litert-lm run \
